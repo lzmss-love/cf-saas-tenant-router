@@ -1,0 +1,22 @@
+{
+  "name": "cf-saas-tenant-router",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare for SaaS 多租户路由：Custom Hostname + Worker fallback origin + D1 租户表",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "deploy:remote-d1": "wrangler deploy --remote",
+    "d1:init": "wrangler d1 migrations apply saas-tenants --remote",
+    "d1:query": "wrangler d1 execute saas-tenants --remote",
+    "setup:zone": "node scripts/setup-zone.mjs",
+    "tenant:add": "node scripts/register-tenant.mjs",
+    "tenant:wait": "node scripts/wait-hostname.mjs",
+    "optimize": "node scripts/optimize.mjs",
+    "dev": "wrangler dev",
+    "init": "node scripts/init.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

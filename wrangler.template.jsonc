@@ -1,0 +1,38 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "saas-tenant-router",
+  "compatibility_date": "2025-01-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "main": "src/index.js",
+
+  // 验证阶段临时开启 workers.dev 子域；生产可改回 false
+  "workers_dev": true,
+
+  // 运行时配置（部署 vars）。__XXX__ 占位符由 scripts/init.mjs（本机）或 GitHub Actions（secrets）渲染。
+  "vars": {
+    "OWN_ZONE": "__ZONE__",
+    "OWN_ZONE_ID": "__ZONE_ID__",
+    "CNAME_TARGET": "__CNAME_TARGET__",
+    "OWN_WORKERSDEV_SUFFIX": "__WORKERS_DEV_SUFFIX__",
+    "OPT_TEST_HOST": "__OPT_TEST_HOST__",
+    "DCV_HASH": "",
+    "OPT_PRESETS": "vivid43.cf.090227.xyz,cf.090227.xyz,cloudflare.182682.xyz",
+  },
+
+  // 通配路由：进 zone 的全部流量（含所有客户 Custom Hostname）都打进 Worker
+  "routes": [
+    {
+      "zone_id": "__ZONE_ID__",
+      "pattern": "*/*",
+    },
+  ],
+
+  // 租户/接入码/日志库
+  "d1_databases": [
+    {
+      "binding": "TENANTS_DB",
+      "database_name": "saas-tenants",
+      "database_id": "__D1_ID__",
+    },
+  ],
+}
