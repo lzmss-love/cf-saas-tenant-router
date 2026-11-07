@@ -1,0 +1,170 @@
+name: Deploy
+
+# push 到 master 自动部署；也可在 Actions 页手动触发。
+# 全流程：查 zone id → 建/找 D1 → 渲染配置 → 部署 → 迁移 → 运行时密钥 → DNS → Fallback Origin
+# 唯一无法自动化的：Enable Cloudflare for SaaS（需绑卡，每个账号一次）
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 目标 Environment 名（对应一个 CF 账号，如 luoli/maowei/mysyun/新账号名；留空则用本仓库 secrets）
+        required: false
+        type: string
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    # 手动触发时用所选账号的 Environment secrets；push 触发无 inputs → 空 → 用本仓库 secrets
+    environment: ${{ inputs.target != '' && inputs.target || '' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      # secrets 未配置时友好跳过（Actions 绿灯），配置后自动恢复部署
+      - name: Check deploy secrets
+        id: chk
+        run: |
+          if [ -z "${{ secrets.CF_ZONE }}" ] || [ -z "${{ secrets.CLOUDFLARE_API_TOKEN }}" ] || [ -z "${{ secrets.CLOUDFLARE_ACCOUNT_ID }}" ] || [ -z "${{ secrets.CF_ADMIN_TOKEN }}" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::部署 secrets 未配置。最少需要 4 个：CF_ZONE、CLOUDFLARE_API_TOKEN、CLOUDFLARE_ACCOUNT_ID、CF_ADMIN_TOKEN。见 README「自动部署」一节。"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-node@v5
+        if: steps.chk.outputs.skip != 'true'
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+        if: steps.chk.outputs.skip != 'true'
+
+      # 查 zone id（或用 secrets 显式值）；D1 不存在则自动创建
+      - name: Resolve zone id & ensure D1
+        id: res
+        if: steps.chk.outputs.skip != 'true'
+        run: |
+          API="${{ secrets.CLOUDFLARE_API_TOKEN }}"
+          ACC="${{ secrets.CLOUDFLARE_ACCOUNT_ID }}"
+          ZONE="${{ secrets.CF_ZONE }}"
+
+          echo "[diag] account=${ACC:0:8}... zone=${ZONE} token_len=${#API}"
+
+          # 指定目标 Environment 时，一律按 zone 名在目标账号实时解析：
+          # GitHub 会让 Environment 缺失的 secret 回退到仓库级 secret（可能是别的账号的 ID），必须忽略。
+          TARGET="${{ inputs.target }}"
+          ZID=""
+          if [ -z "$TARGET" ]; then
+            ZID="${{ secrets.CF_ZONE_ID }}"
+          fi
+          if [ -z "$ZID" ]; then
+            RESP=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer $API" "https://api.cloudflare.com/client/v4/zones?name=$ZONE")
+            CODE=$(echo "$RESP" | tail -1)
+            echo "[diag] zone 查询 HTTP=$CODE body=$(echo "$RESP" | head -n -1 | head -c 200)"
+            ZID=$(echo "$RESP" | head -n -1 | jq -r --arg acc "$ACC" '[.result[] | select(.account.id == $acc)] | .[0].id // empty')
+          fi
+          if [ -z "$ZID" ]; then
+            echo "::error::zone id 查询失败——zone 名 '$ZONE' 在该账号下不存在，或 token 缺 Zone:Read 权限"
+            exit 1
+          fi
+
+          DID=""
+          if [ -z "$TARGET" ]; then
+            DID="${{ secrets.CF_D1_ID }}"
+          fi
+          if [ -z "$DID" ]; then
+            RESP=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer $API" "https://api.cloudflare.com/client/v4/accounts/$ACC/d1/database?name=saas-tenants")
+            CODE=$(echo "$RESP" | tail -1)
+            echo "[diag] D1 查询 HTTP=$CODE body=$(echo "$RESP" | head -n -1 | head -c 200)"
+            DID=$(echo "$RESP" | head -n -1 | jq -r '.result[0].uuid // empty')
+          fi
+          if [ -z "$DID" ]; then
+            echo "D1 saas-tenants 不存在，自动创建 ..."
+            RESP=$(curl -s -w "\n%{http_code}" -X POST -H "Authorization: Bearer $API" -H "Content-Type: application/json"               -d '{"name":"saas-tenants"}'               "https://api.cloudflare.com/client/v4/accounts/$ACC/d1/database")
+            CODE=$(echo "$RESP" | tail -1)
+            echo "[diag] D1 创建 HTTP=$CODE body=$(echo "$RESP" | head -n -1 | head -c 250)"
+            DID=$(echo "$RESP" | head -n -1 | jq -r '.result.uuid // empty')
+          fi
+          if [ -z "$DID" ]; then
+            echo "::error::D1 查询/创建失败——token 需 Account D1:Edit 权限，或直接配置 secret CF_D1_ID"
+            exit 1
+          fi
+
+          CT="${{ secrets.CF_CNAME_TARGET }}"
+          if [ -z "$CT" ]; then CT="opt.$ZONE"; fi
+
+          echo "[diag] resolved zone_id=$ZID (target=${TARGET:-repo-secrets})"
+          echo "zone_id=$ZID"    >> "$GITHUB_OUTPUT"
+          echo "d1_id=$DID"      >> "$GITHUB_OUTPUT"
+          echo "cname_target=$CT" >> "$GITHUB_OUTPUT"
+          echo "Resolved: zone=$ZID d1=$DID target=$CT"
+
+      - name: Render wrangler.jsonc from secrets
+        if: steps.chk.outputs.skip != 'true'
+        run: |
+          sed -e "s/__ZONE__/${CF_ZONE}/g"               -e "s/__ZONE_ID__/${ZONE_ID}/g"               -e "s/__D1_ID__/${D1_ID}/g"               -e "s/__CNAME_TARGET__/${CNAME_TARGET}/g"               -e "s/__WORKERS_DEV_SUFFIX__/${CF_WORKERS_DEV_SUFFIX}/g"               -e "s/__OPT_TEST_HOST__/${CF_OPT_TEST_HOST}/g"               wrangler.template.jsonc > wrangler.jsonc
+        env:
+          CF_ZONE: ${{ secrets.CF_ZONE }}
+          CF_WORKERS_DEV_SUFFIX: ${{ secrets.CF_WORKERS_DEV_SUFFIX }}
+          CF_OPT_TEST_HOST: ${{ secrets.CF_OPT_TEST_HOST }}
+          ZONE_ID: ${{ steps.res.outputs.zone_id }}
+          D1_ID: ${{ steps.res.outputs.d1_id }}
+          CNAME_TARGET: ${{ steps.res.outputs.cname_target }}
+
+      - name: Deploy Worker
+        if: steps.chk.outputs.skip != 'true'
+        run: npx wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Apply D1 migrations
+        if: steps.chk.outputs.skip != 'true'
+        run: npx wrangler d1 migrations apply saas-tenants --remote
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      # 运行时密钥自动写入 Worker（面板的 CF 功能 / 面板密码 / TG 场景可选）
+      - name: Set runtime secrets
+        if: steps.chk.outputs.skip != 'true'
+        run: |
+          if [ -z "$RUNTIME_API_TOKEN" ]; then echo "::warning::运行时 CF_API_TOKEN 值为空，跳过"; else
+            printenv RUNTIME_API_TOKEN | npx wrangler secret put CF_API_TOKEN; fi
+          if [ -z "$ADMIN_TOKEN_VALUE" ]; then echo "::warning::CF_ADMIN_TOKEN 未配置（面板密码，格式 账号:密码），面板将无法登录——补配后重跑"; else
+            printenv ADMIN_TOKEN_VALUE | npx wrangler secret put ADMIN_TOKEN; fi
+          if [ -n "$TGPROXY_VALUE" ]; then
+            printenv TGPROXY_VALUE | npx wrangler secret put TGPROXY_SECRET
+          else
+            echo "CF_TGPROXY_SECRET 未配置（仅 TG WEB 代理场景需要），跳过"
+          fi
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # 运行时 CF_API_TOKEN：优先专用 DNS token，未配置则复用部署 token（需含 DNS Edit）
+          RUNTIME_API_TOKEN: ${{ secrets.CF_DNS_TOKEN || secrets.CLOUDFLARE_API_TOKEN }}
+          ADMIN_TOKEN_VALUE: ${{ secrets.CF_ADMIN_TOKEN }}
+          TGPROXY_VALUE: ${{ secrets.CF_TGPROXY_SECRET }}
+
+      # token 有 Zone.DNS:Edit 时幂等补齐基础记录；无权限则警告跳过
+      - name: Ensure DNS records
+        if: steps.chk.outputs.skip != 'true'
+        run: |
+          if [ -n "$CF_DNS_TOKEN_VALUE" ]; then
+            printenv CF_DNS_TOKEN_VALUE > .dns-token
+          else
+            printenv CLOUDFLARE_API_TOKEN > .dns-token
+          fi
+          node scripts/ensure-dns.mjs
+          rm -f .dns-token
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_DNS_TOKEN_VALUE: ${{ secrets.CF_DNS_TOKEN }}
+        continue-on-error: true
+

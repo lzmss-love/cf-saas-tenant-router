@@ -1,0 +1,12 @@
+node_modules/
+.wrangler/
+dist/
+*.tgz
+.env
+.env.local
+.env.*.local
+.DS_Store
+logs/
+*.log
+wrangler.jsonc
+cf-api.json
