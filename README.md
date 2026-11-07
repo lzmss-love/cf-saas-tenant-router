@@ -7,13 +7,13 @@ Cloudflare for SaaS 多租户接入系统：客户域名**不托管 CF**，加�
 - 模板化：任何新 CF 账号从零部署零代码修改（本机 `npm run init` 或模板仓库 + secrets）
 
 ```
-客户域名（如 test.vs.new.tg，NS 留在客户自己的 DNS）
+客户域名（如 shop.customer.com，NS 留在客户自己的 DNS）
         │ CNAME → opt.<宿主域名>（优选 IP，灰云 A 记录）
         ▼
 Cloudflare 边缘 ── Custom Hostname（证书自动签发）── */* route
         ▼
 saas-tenant-router Worker
-   ├─ 按 Host 查 D1 租户表 → 转发上游（tgproxy / cf-erp / cf-subcloud …）
+   ├─ 按 Host 查 D1 租户表 → 转发上游（任意 HTTP/HTTPS 服务）
    ├─ Origin 改写 + 页面域名替换 + WebSocket 透传（兼容 tgproxy 等严格校验的上游）
    └─ bridge cap 重算（客户手里任何域名版本的接入凭证都能过认证）
 ```
@@ -58,12 +58,7 @@ saas-tenant-router Worker
 **前置（人工）**：
 1. 宿主域名加入新 CF 账号（NS 托管，Free 即可）
 2. 控制台 Enable Cloudflare for SaaS（SSL/TLS → Custom Hostnames → Enable，绑卡）
-3. 建一个 API Token，权限（init 要读写 DNS 和建库）：
-   - **Zone → Zone → Read**
-   - **Zone → DNS → Edit**
-   - **Account → D1 → Edit**
-   - （模板 "Edit Cloudflare Workers" 可顺带勾上，后续 deploy 用同一 token）
-   - Zone Resources 选你的宿主 zone
+3. 建一个 API Token（init 要查 zone、读写 DNS、建 D1；建议直接按下方「自动部署」的 **11 项完整权限清单** 建，deploy 也能用同一个 token），Zone Resources 选你的宿主 zone。
 
 **在哪里跑**：在你自己电脑的终端、**clone 出来的新目录**里跑（init 会重写该目录的 wrangler.jsonc，不要在已有部署的目录执行，否则当前账号配置会被覆盖）。
 
@@ -134,12 +129,30 @@ secrets 未配置时 Actions 绿灯跳过并提示，配置后自动恢复。
 
 **一次性配置（需要你操作）**：
 
-1. 建 CF 部署专用 API Token（[dash.cloudflare.com/profile/api-tokens](https://dash.cloudflare.com/profile/api-tokens) → Create Token），权限：
-   - 模板 **"Edit Cloudflare Workers"**
-   - 追加 **Account → D1 → Edit**
-   - 追加 **Zone → DNS → Edit**（自动建 DNS 记录用）
-   - 追加 **Zone → Zone → Read**（自动查 zone id 用）
-   - Zone Resources 选你的宿主 zone
+1. 建 CF 部署专用 API Token（[dash.cloudflare.com/profile/api-tokens](https://dash.cloudflare.com/profile/api-tokens) → Create Token），**完整权限清单（11 项，已实测验证的最小集）**：
+
+   **Account 级**（整个账户）：
+
+   | 权限 | 用途 |
+   |---|---|
+   | Workers Scripts Write | 部署 Worker 代码 |
+   | Workers Scripts Read | 部署状态检查 |
+   | D1 Write | 自动创建 D1 + 执行迁移 |
+   | D1 Read | 查询 D1（查找/校验）|
+
+   **Zone 级**（Zone Resources 选你的宿主 zone）：
+
+   | 权限 | 用途 |
+   |---|---|
+   | Zone Read | 按域名查询 zone id |
+   | DNS Write | 自动建 DNS 记录（service/customers/opt）+ 面板优选管理 |
+   | DNS Read | 查记录是否存在（幂等判断）|
+   | Workers Routes Write | 创建 `*/*` 通配路由 |
+   | Workers Routes Read | 查路由状态 |
+   | SSL and Certificates Write | Custom Hostname 增删 + Fallback Origin |
+   | SSL and Certificates Read | 证书/主机名状态查询 |
+
+   > 该 token 同时会作为 Worker 运行时密钥 `CF_API_TOKEN`（Actions 自动写入），支撑面板的自定义主机名与优选管理——DNS/SSL 权限因此必需。多余权限（WAF/Bot/R2/Pages 等）不要勾，降低 token 泄漏时的影响面。
 
 2. GitHub 仓库 → Settings → Secrets and variables → Actions → New repository secret：
 
